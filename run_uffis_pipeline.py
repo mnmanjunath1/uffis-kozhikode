@@ -49,6 +49,7 @@ from sklearn.svm import SVC
 DB_PATH = "uffis_data.db"
 TRAINING_CSV = "UFFIS_training_data.csv"
 SNAPSHOT_PATH = "location_summary.json"
+PENDING_MD_PATH = "PENDING_REVIEWS.md"
 
 # Same 19 localities as notebook Section 9, with the 3 coastline-offset corrections
 # from earlier validation (West Hill, Kozhikode Beach, Vellayil).
@@ -172,6 +173,15 @@ def init_db(db_path=DB_PATH):
         queued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         reviewed_by TEXT, reviewed_at TIMESTAMP, reviewer_notes TEXT
     );""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS alert_dissemination_log (
+        dissemination_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        review_id INTEGER NOT NULL,
+        tier TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        message_summary TEXT,
+        sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (review_id) REFERENCES alert_review_queue(review_id)
+    );""")
     conn.commit()
     conn.close()
 
@@ -186,6 +196,40 @@ def queue_for_review(locality, score, band, nlp_score, rain_score, db_path=DB_PA
     conn.commit()
     conn.close()
     return status
+
+
+def write_pending_reviews_md(db_path=DB_PATH, md_path=PENDING_MD_PATH):
+    """Human-readable list of everything still awaiting a human decision - .db files
+    aren't readable in GitHub's file viewer, this is. See HOW_TO_REVIEW.md for how
+    to act on a row (or run the "UFFIS review" workflow with the review_id below)."""
+    conn = sqlite3.connect(db_path)
+    df = pd.read_sql(
+        "SELECT review_id, locality, alert_band, fused_score, nlp_score, rain_score, queued_at "
+        "FROM alert_review_queue WHERE status = 'PENDING_REVIEW' ORDER BY fused_score DESC", conn
+    )
+    conn.close()
+
+    lines = [
+        "# Pending human reviews",
+        "",
+        f"Last updated: {datetime.now(timezone.utc).isoformat()}",
+        "",
+        "Nothing here is public yet. To confirm or reject a row, go to the **Actions** tab -> "
+        "**UFFIS review** -> **Run workflow**, and fill in the `review_id` from the table below.",
+        "",
+    ]
+    if df.empty:
+        lines.append("_Nothing pending right now._")
+    else:
+        lines.append("| review_id | locality | band | score | nlp | rain | queued_at |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for _, r in df.iterrows():
+            lines.append(f"| {r.review_id} | {r.locality} | {r.alert_band} | {r.fused_score:.1f} "
+                         f"| {r.nlp_score:.1f} | {r.rain_score:.1f} | {r.queued_at} |")
+
+    with open(md_path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    log(f"Wrote {md_path} — {len(df)} row(s) awaiting review.")
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +281,8 @@ def run():
 
     with open(SNAPSHOT_PATH, "w") as f:
         json.dump(summary, f, indent=2)
+
+    write_pending_reviews_md()
 
     log(f"Wrote {SNAPSHOT_PATH} — {pending_count} locality/localities queued for human review "
         f"(nothing is public until a reviewer confirms it in the Alerts tab).")
