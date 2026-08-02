@@ -30,6 +30,7 @@ Requires: UFFIS_training_data.csv in the same directory.
 """
 
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -50,6 +51,7 @@ DB_PATH = "uffis_data.db"
 TRAINING_CSV = "UFFIS_training_data.csv"
 SNAPSHOT_PATH = "location_summary.json"
 PENDING_MD_PATH = "PENDING_REVIEWS.md"
+HEADLINE_LOG_PATH = "live_headlines_log.csv"
 
 # Same 19 localities as notebook Section 9, with the 3 coastline-offset corrections
 # from earlier validation (West Hill, Kozhikode Beach, Vellayil).
@@ -198,6 +200,49 @@ def queue_for_review(locality, score, band, nlp_score, rain_score, db_path=DB_PA
     return status
 
 
+def append_to_headline_log(classified, log_path=HEADLINE_LOG_PATH):
+    """Appends every genuinely live-fetched headline (real text, real fetch timestamp)
+    to a growing CSV — this is what actually extends real-data coverage forward through
+    next month and beyond, automatically, every 15 minutes, without anyone needing to
+    hand-search for news. Deduplicates on title so re-fetching the same still-trending
+    headline across runs doesn't pad the log with repeats.
+
+    Note: this log is NOT the same file as UFFIS_training_data.csv, and rows here don't
+    have a Label yet - they're unlabelled real headlines, not automatically-trusted
+    ground truth. Folding reviewed/labelled rows from this log into the official
+    training set periodically is a human step (see Way Forward: "Larger, real-world
+    dataset"), kept deliberately separate from automatic classifier retraining so the
+    training data's quality doesn't silently drift.
+    """
+    if not classified:
+        return 0
+
+    new_rows = pd.DataFrame([{
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "title": c["title"],
+        "published": c.get("published"),
+        "nlp_confidence": c["nlp_confidence"],
+        "corp_localities": "; ".join(c["corp_localities"]) or "",
+        "district_only": "; ".join(c["district_only"]) or "",
+        "neighboring_districts": "; ".join(c["neighboring_districts"]) or "",
+        "city_level": c["city_level"],
+    } for c in classified])
+
+    if os.path.exists(log_path):
+        existing = pd.read_csv(log_path)
+        combined = pd.concat([existing, new_rows], ignore_index=True)
+        before = len(combined)
+        combined = combined.drop_duplicates(subset=["title"], keep="first")
+        added = len(combined) - len(existing)
+    else:
+        combined = new_rows.drop_duplicates(subset=["title"], keep="first")
+        added = len(combined)
+
+    combined.to_csv(log_path, index=False)
+    log(f"Appended to {log_path} — {added} new unique headline(s), {len(combined)} total logged since tracking began.")
+    return added
+
+
 def write_pending_reviews_md(db_path=DB_PATH, md_path=PENDING_MD_PATH):
     """Human-readable list of everything still awaiting a human decision - .db files
     aren't readable in GitHub's file viewer, this is. See HOW_TO_REVIEW.md for how
@@ -282,6 +327,7 @@ def run():
     with open(SNAPSHOT_PATH, "w") as f:
         json.dump(summary, f, indent=2)
 
+    append_to_headline_log(classified)
     write_pending_reviews_md()
 
     log(f"Wrote {SNAPSHOT_PATH} — {pending_count} locality/localities queued for human review "
